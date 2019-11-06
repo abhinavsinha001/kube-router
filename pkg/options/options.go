@@ -160,7 +160,7 @@ func (s *KubeRouterConfig) AddFlags(fs *pflag.FlagSet) {
 	// 	"Password that cluster-node BGP servers will use to authenticate one another when \"--nodes-full-mesh\" is set.")
 	fs.StringVarP(&s.VLevel, "v", "v", "0", "log level for V logs")
 	fs.Uint16Var(&s.HealthPort, "health-port", 20244, "Health check port, 0 = Disabled")
-	fs.BoolVar(&s.OverrideNextHop, "override-nexthop", false, "Override the next-hop in bgp routes sent to peers with the local ip.")
+	fs.BoolVar(&s.OverrideNextHop, "override-nexthop", true, "Override the next-hop in bgp routes sent to peers with the local ip.")
 	fs.BoolVar(&s.DisableSrcDstCheck, "disable-source-dest-check", true,
 		"Disable the source-dest-check attribute for AWS EC2 instances. When this option is false, it must be set some other way.")
 }
