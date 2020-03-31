@@ -30,6 +30,10 @@ else ifeq ($(GOARCH), s390x)
 ARCH_TAG_PREFIX=$(GOARCH)
 FILE_ARCH=IBM S/390
 DOCKERFILE_SED_EXPR?=
+else ifeq ($(GOARCH), ppc64le)
+ARCH_TAG_PREFIX=$(GOARCH)
+FILE_ARCH=64-bit PowerPC
+DOCKERFILE_SED_EXPR?=
 else
 ARCH_TAG_PREFIX=amd64
 DOCKERFILE_SED_EXPR?=
@@ -51,7 +55,7 @@ else
 	GOARCH=$(GOARCH) CGO_ENABLED=0 go build -ldflags '-X github.com/cloudnativelabs/kube-router/pkg/cmd.version=$(GIT_COMMIT) -X github.com/cloudnativelabs/kube-router/pkg/cmd.buildDate=$(BUILD_DATE)' -o kube-router cmd/kube-router/kube-router.go
 endif
 
-test: gofmt gomoqs ## Runs code quality pipelines (gofmt, tests, coverage, lint, etc)
+test: gofmt ## Runs code quality pipelines (gofmt, tests, coverage, lint, etc)
 ifeq "$(BUILD_IN_DOCKER)" "true"
 	$(DOCKER) run -v $(PWD):/go/src/github.com/cloudnativelabs/kube-router -w /go/src/github.com/cloudnativelabs/kube-router $(DOCKER_BUILD_IMAGE) \
 	    sh -c 'go test -v -timeout 30s github.com/cloudnativelabs/kube-router/cmd/kube-router/ github.com/cloudnativelabs/kube-router/pkg/...'
@@ -127,12 +131,12 @@ push-release: push
 push-manifest:
 	@echo Starting kube-router manifest push.
 	./manifest-tool push from-args \
-		--platforms linux/amd64,linux/arm64,linux/arm,linux/s390x \
+		--platforms linux/amd64,linux/arm64,linux/arm,linux/s390x,linux/ppc64le \
 		--template "$(REGISTRY):ARCH-${RELEASE_TAG}" \
 		--target "$(REGISTRY):$(RELEASE_TAG)"
 
 	./manifest-tool push from-args \
-		--platforms linux/amd64,linux/arm64,linux/arm,linux/s390x \
+		--platforms linux/amd64,linux/arm64,linux/arm,linux/s390x,linux/ppc64le \
 		--template "$(REGISTRY):ARCH-${RELEASE_TAG}" \
 		--target "$(REGISTRY):latest"
 
@@ -148,8 +152,11 @@ release: push-release github-release ## Pushes a release to DockerHub and GitHub
 
 clean: ## Removes the kube-router binary and Docker images
 	rm -f kube-router
-	$(DOCKER) rmi $(REGISTRY_DEV)
-
+	rm -f gobgp
+	rm -f Dockerfile.$(GOARCH).run
+	if [ $(shell $(DOCKER) images -q $(REGISTRY_DEV):$(IMG_TAG) 2> /dev/null) ]; then \
+		 $(DOCKER) rmi $(REGISTRY_DEV):$(IMG_TAG); \
+	fi
 gofmt: ## Tells you what files need to be gofmt'd.
 	@build/verify-gofmt.sh
 

@@ -29,6 +29,7 @@ type KubeRouterConfig struct {
 	EnableOverlay                  bool
 	EnablePodEgress                bool
 	EnablePprof                    bool
+	ExcludedCidrs                  []string
 	FullMeshMode                   bool
 	OverlayType                    string
 	GlobalHairpinMode              bool
@@ -39,6 +40,7 @@ type KubeRouterConfig struct {
 	IpvsSyncPeriod                 time.Duration
 	IpvsGracefulPeriod             time.Duration
 	IpvsGracefulTermination        bool
+	IpvsPermitAll                  bool
 	Kubeconfig                     string
 	MasqueradeAll                  bool
 	Master                         string
@@ -98,6 +100,8 @@ func (s *KubeRouterConfig) AddFlags(fs *pflag.FlagSet) {
 		"SNAT all traffic to cluster IP/node port.")
 	fs.StringVar(&s.ClusterCIDR, "cluster-cidr", s.ClusterCIDR,
 		"CIDR range of pods in the cluster. It is used to identify traffic originating from and destinated to pods.")
+	fs.StringSliceVar(&s.ExcludedCidrs, "excluded-cidrs", s.ExcludedCidrs,
+		"Excluded CIDRs are used to exclude IPVS rules from deletion.")
 	fs.BoolVar(&s.EnablePodEgress, "enable-pod-egress", true,
 		"SNAT traffic from Pods to destinations outside the cluster.")
 	fs.DurationVar(&s.IPTablesSyncPeriod, "iptables-sync-period", s.IPTablesSyncPeriod,
@@ -108,6 +112,8 @@ func (s *KubeRouterConfig) AddFlags(fs *pflag.FlagSet) {
 		"The graceful period before removing destinations from IPVS services (e.g. '5s', '1m', '2h22m'). Must be greater than 0.")
 	fs.BoolVar(&s.IpvsGracefulTermination, "ipvs-graceful-termination", false,
 		"Enables the experimental IPVS graceful terminaton capability")
+	fs.BoolVar(&s.IpvsPermitAll, "ipvs-permit-all", true,
+		"Enables rule to accept all incoming traffic to service VIP's on the node.")
 	fs.DurationVar(&s.RoutesSyncPeriod, "routes-sync-period", s.RoutesSyncPeriod,
 		"The delay between route updates and advertisements (e.g. '5s', '1m', '2h22m'). Must be greater than 0.")
 	fs.BoolVar(&s.AdvertiseClusterIp, "advertise-cluster-ip", false,

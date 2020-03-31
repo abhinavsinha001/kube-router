@@ -30,7 +30,6 @@ import (
 	"github.com/vishvananda/netns"
 	"golang.org/x/net/context"
 	api "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 )
@@ -210,8 +209,10 @@ type NetworkServicesController struct {
 	serviceMap          serviceInfoMap
 	endpointsMap        endpointsInfoMap
 	podCidr             string
+	excludedCidrs       []net.IPNet
 	masqueradeAll       bool
 	globalHairpin       bool
+	ipvsPermitAll       bool
 	client              kubernetes.Interface
 	nodeportBindOnAllIp bool
 	MetricsEnabled      bool
@@ -240,6 +241,7 @@ type serviceInfo struct {
 	namespace                string
 	clusterIP                net.IP
 	port                     int
+	targetPort               string
 	protocol                 string
 	nodePort                 int
 	sessionAffinity          bool
@@ -275,7 +277,7 @@ type endpointsInfo struct {
 type endpointsInfoMap map[string][]endpointsInfo
 
 // Run periodically sync ipvs configuration to reflect desired state of services and endpoints
-func (nsc *NetworkServicesController) Run(healthChan chan<- *healthcheck.ControllerHeartbeat, stopCh <-chan struct{}, wg *sync.WaitGroup) error {
+func (nsc *NetworkServicesController) Run(healthChan chan<- *healthcheck.ControllerHeartbeat, stopCh <-chan struct{}, wg *sync.WaitGroup) {
 	t := time.NewTicker(nsc.syncPeriod)
 	defer t.Stop()
 	defer wg.Done()
@@ -292,25 +294,25 @@ func (nsc *NetworkServicesController) Run(healthChan chan<- *healthcheck.Control
 	// enable masquerade rule
 	err = nsc.ensureMasqueradeIptablesRule()
 	if err != nil {
-		return errors.New("Failed to do add masquerade rule in POSTROUTING chain of nat table due to: %s" + err.Error())
+		glog.Errorf("Failed to do add masquerade rule in POSTROUTING chain of nat table due to: %s", err.Error())
 	}
 	// https://www.kernel.org/doc/Documentation/networking/ipvs-sysctl.txt
 	// enable ipvs connection tracking
 	sysctlErr := utils.SetSysctl("net/ipv4/vs/conntrack", 1)
 	if sysctlErr != nil {
-		return errors.New(sysctlErr.Error())
+		glog.Error(sysctlErr.Error())
 	}
 
 	// LVS failover not working with UDP packets https://access.redhat.com/solutions/58653
 	sysctlErr = utils.SetSysctl("net/ipv4/vs/expire_nodest_conn", 1)
 	if sysctlErr != nil {
-		return errors.New(sysctlErr.Error())
+		glog.Error(sysctlErr.Error())
 	}
 
 	// LVS failover not working with UDP packets https://access.redhat.com/solutions/58653
 	sysctlErr = utils.SetSysctl("net/ipv4/vs/expire_quiescent_template", 1)
 	if sysctlErr != nil {
-		return errors.New(sysctlErr.Error())
+		glog.Error(sysctlErr.Error())
 	}
 
 	// https://github.com/kubernetes/kubernetes/pull/71114
@@ -319,27 +321,28 @@ func (nsc *NetworkServicesController) Run(healthChan chan<- *healthcheck.Control
 		// Check if the error is fatal, on older kernels this option does not exist and the same behaviour is default
 		// if option is not found just log it
 		if sysctlErr.IsFatal() {
-			return errors.New(sysctlErr.Error())
+			glog.Fatal(sysctlErr.Error())
+		} else {
+			glog.Info(sysctlErr.Error())
 		}
-		glog.Info(sysctlErr.Error())
 	}
 
 	// https://github.com/kubernetes/kubernetes/pull/70530/files
 	sysctlErr = utils.SetSysctl("net/ipv4/conf/all/arp_ignore", 1)
 	if sysctlErr != nil {
-		return errors.New(sysctlErr.Error())
+		glog.Error(sysctlErr.Error())
 	}
 
 	// https://github.com/kubernetes/kubernetes/pull/70530/files
 	sysctlErr = utils.SetSysctl("net/ipv4/conf/all/arp_announce", 2)
 	if sysctlErr != nil {
-		return errors.New(sysctlErr.Error())
+		glog.Error(sysctlErr.Error())
 	}
 
 	// https://github.com/cloudnativelabs/kube-router/issues/282
 	err = nsc.setupIpvsFirewall()
 	if err != nil {
-		return errors.New("Error setting up ipvs firewall: " + err.Error())
+		glog.Error("Error setting up ipvs firewall: " + err.Error())
 	}
 
 	gracefulTicker := time.NewTicker(5 * time.Second)
@@ -348,7 +351,7 @@ func (nsc *NetworkServicesController) Run(healthChan chan<- *healthcheck.Control
 	select {
 	case <-stopCh:
 		glog.Info("Shutting down network services controller")
-		return nil
+		return
 	default:
 		err := nsc.doSync()
 		if err != nil {
@@ -362,7 +365,7 @@ func (nsc *NetworkServicesController) Run(healthChan chan<- *healthcheck.Control
 		select {
 		case <-stopCh:
 			glog.Info("Shutting down network services controller")
-			return nil
+			return
 
 		case <-gracefulTicker.C:
 			if nsc.readyForUpdates && nsc.gracefulTermination {
@@ -511,14 +514,20 @@ func (nsc *NetworkServicesController) setupIpvsFirewall() error {
 		return fmt.Errorf("Failed to run iptables command: %s", err.Error())
 	}
 
+	// config.IpvsPermitAll: true then create INPUT/KUBE-ROUTER-SERVICE Chain creation else return
+	if !nsc.ipvsPermitAll {
+		return nil
+	}
+
 	var comment string
 	var args []string
+	var exists bool
 
 	comment = "allow input traffic to ipvs services"
 	args = []string{"-m", "comment", "--comment", comment,
 		"-m", "set", "--match-set", ipvsServicesIPSetName, "dst,dst",
 		"-j", "ACCEPT"}
-	exists, err := iptablesCmdHandler.Exists("filter", ipvsFirewallChainName, args...)
+	exists, err = iptablesCmdHandler.Exists("filter", ipvsFirewallChainName, args...)
 	if err != nil {
 		return fmt.Errorf("Failed to run iptables command: %s", err.Error())
 	}
@@ -567,8 +576,8 @@ func (nsc *NetworkServicesController) setupIpvsFirewall() error {
 
 func (nsc *NetworkServicesController) cleanupIpvsFirewall() {
 	/*
-	   - delete firewall rules
-	   - delete ipsets
+		- delete firewall rules
+		- delete ipsets
 	*/
 	var err error
 
@@ -833,376 +842,6 @@ func hasActiveEndpoints(svc *serviceInfo, endpoints []endpointsInfo) bool {
 	return false
 }
 
-// sync the ipvs service and server details configured to reflect the desired state of services and endpoint
-// as learned from services and endpoints information from the api server
-func (nsc *NetworkServicesController) syncIpvsServices(serviceInfoMap serviceInfoMap, endpointsInfoMap endpointsInfoMap) error {
-	var ipvsSvcs []*ipvs.Service
-	start := time.Now()
-
-	defer func() {
-		endTime := time.Since(start)
-		if nsc.MetricsEnabled {
-			metrics.ControllerIpvsServicesSyncTime.Observe(endTime.Seconds())
-		}
-		glog.V(1).Infof("sync ipvs services took %v", endTime)
-	}()
-
-	dummyVipInterface, err := nsc.ln.getKubeDummyInterface()
-	if err != nil {
-		return errors.New("Failed creating dummy interface: " + err.Error())
-	}
-
-	glog.V(1).Infof("Setting up policy routing required for Direct Server Return functionality.")
-	err = nsc.ln.setupPolicyRoutingForDSR()
-	if err != nil {
-		return errors.New("Failed setup PBR for DSR due to: " + err.Error())
-	}
-	glog.V(1).Infof("Custom routing table " + customDSRRouteTableName + " required for Direct Server Return is setup as expected.")
-
-	glog.V(1).Infof("Setting up custom route table required to add routes for external IP's.")
-	err = nsc.ln.setupRoutesForExternalIPForDSR(serviceInfoMap)
-	if err != nil {
-		glog.Errorf("Failed setup custom routing table required to add routes for external IP's due to: " + err.Error())
-		return errors.New("Failed setup custom routing table required to add routes for external IP's due to: " + err.Error())
-	}
-	glog.V(1).Infof("Custom routing table " + externalIPRouteTableName + " required for Direct Server Return is setup as expected.")
-
-	// map of active services and service endpoints
-	activeServiceEndpointMap := make(map[string][]string)
-
-	ipvsSvcs, err = nsc.ln.ipvsGetServices()
-	if err != nil {
-		return errors.New("Failed get list of IPVS services due to: " + err.Error())
-	}
-
-	for k, svc := range serviceInfoMap {
-		var protocol uint16
-
-		switch svc.protocol {
-		case "tcp":
-			protocol = syscall.IPPROTO_TCP
-		case "udp":
-			protocol = syscall.IPPROTO_UDP
-		default:
-			protocol = syscall.IPPROTO_NONE
-		}
-
-		endpoints := endpointsInfoMap[k]
-
-		if svc.local && !hasActiveEndpoints(svc, endpoints) {
-			glog.V(1).Infof("Skipping service %s/%s as it does not have active endpoints\n", svc.namespace, svc.name)
-			continue
-		}
-
-		// assign cluster IP of the service to the dummy interface so that its routable from the pod's on the node
-		err := nsc.ln.ipAddrAdd(dummyVipInterface, svc.clusterIP.String(), true)
-		if err != nil {
-			continue
-		}
-
-		// create IPVS service for the service to be exposed through the cluster ip
-		ipvsClusterVipSvc, err := nsc.ln.ipvsAddService(ipvsSvcs, svc.clusterIP, protocol, uint16(svc.port), svc.sessionAffinity, svc.scheduler, svc.flags)
-		if err != nil {
-			glog.Errorf("Failed to create ipvs service for cluster ip: %s", err.Error())
-			continue
-		}
-		var clusterServiceId = generateIpPortId(svc.clusterIP.String(), svc.protocol, strconv.Itoa(svc.port))
-		activeServiceEndpointMap[clusterServiceId] = make([]string, 0)
-
-		// create IPVS service for the service to be exposed through the nodeport
-		var ipvsNodeportSvcs []*ipvs.Service
-
-		var nodeServiceIds []string
-
-		if svc.nodePort != 0 {
-			if nsc.nodeportBindOnAllIp {
-				// bind on all interfaces instead
-				addrs, err := getAllLocalIPs()
-
-				if err != nil {
-					glog.Errorf("Could not get list of system addresses for ipvs services: %s", err.Error())
-					continue
-				}
-
-				if len(addrs) == 0 {
-					glog.Errorf("No IP addresses returned for nodeport service creation!")
-					continue
-				}
-
-				ipvsNodeportSvcs = make([]*ipvs.Service, len(addrs))
-				nodeServiceIds = make([]string, len(addrs))
-
-				for i, addr := range addrs {
-					ipvsNodeportSvcs[i], err = nsc.ln.ipvsAddService(ipvsSvcs, addr.IP, protocol, uint16(svc.nodePort), svc.sessionAffinity, svc.scheduler, svc.flags)
-					if err != nil {
-						glog.Errorf("Failed to create ipvs service for node port due to: %s", err.Error())
-						continue
-					}
-
-					nodeServiceIds[i] = generateIpPortId(addr.IP.String(), svc.protocol, strconv.Itoa(svc.nodePort))
-					activeServiceEndpointMap[nodeServiceIds[i]] = make([]string, 0)
-				}
-			} else {
-				ipvsNodeportSvcs = make([]*ipvs.Service, 1)
-				ipvsNodeportSvcs[0], err = nsc.ln.ipvsAddService(ipvsSvcs, nsc.nodeIP, protocol, uint16(svc.nodePort), svc.sessionAffinity, svc.scheduler, svc.flags)
-				if err != nil {
-					glog.Errorf("Failed to create ipvs service for node port due to: %s", err.Error())
-					continue
-				}
-
-				nodeServiceIds = make([]string, 1)
-				nodeServiceIds[0] = generateIpPortId(nsc.nodeIP.String(), svc.protocol, strconv.Itoa(svc.nodePort))
-				activeServiceEndpointMap[nodeServiceIds[0]] = make([]string, 0)
-			}
-		}
-
-		externalIpServices := make([]externalIPService, 0)
-		// create IPVS service for the service to be exposed through the external IP's
-		// For external IP (which are meant for ingress traffic) Kube-router setsup IPVS services
-		// based on FWMARK to enable Direct server return functionality. DSR requires a director
-		// without a VIP http://www.austintek.com/LVS/LVS-HOWTO/HOWTO/LVS-HOWTO.routing_to_VIP-less_director.html
-		// to avoid martian packets
-		extIPSet := sets.NewString(svc.externalIPs...)
-		if !svc.skipLbIps {
-			extIPSet = extIPSet.Union(sets.NewString(svc.loadBalancerIPs...))
-		}
-
-		for _, externalIP := range extIPSet.List() {
-			var externalIpServiceId string
-			if svc.directServerReturn && svc.directServerReturnMethod == "tunnel" {
-				ipvsExternalIPSvc, err := nsc.ln.ipvsAddFWMarkService(net.ParseIP(externalIP), protocol, uint16(svc.port), svc.sessionAffinity, svc.scheduler, svc.flags)
-				if err != nil {
-					glog.Errorf("Failed to create ipvs service for External IP: %s due to: %s", externalIP, err.Error())
-					continue
-				}
-				externalIpServices = append(externalIpServices, externalIPService{ipvsSvc: ipvsExternalIPSvc, externalIp: externalIP})
-				fwMark := generateFwmark(externalIP, svc.protocol, strconv.Itoa(svc.port))
-				externalIpServiceId = fmt.Sprint(fwMark)
-
-				// ensure there is iptables mangle table rule to FWMARK the packet
-				err = setupMangleTableRule(externalIP, svc.protocol, strconv.Itoa(svc.port), externalIpServiceId)
-				if err != nil {
-					glog.Errorf("Failed to setup mangle table rule to FMWARD the traffic to external IP")
-					continue
-				}
-
-				// ensure VIP less director. we dont assign VIP to any interface
-				err = nsc.ln.ipAddrDel(dummyVipInterface, externalIP)
-
-				// do policy routing to deliver the packet locally so that IPVS can pick the packet
-				err = routeVIPTrafficToDirector("0x" + fmt.Sprintf("%x", fwMark))
-				if err != nil {
-					glog.Errorf("Failed to setup ip rule to lookup traffic to external IP: %s through custom "+
-						"route table due to %s", externalIP, err.Error())
-					continue
-				}
-			} else {
-				// ensure director with vip assigned
-				err := nsc.ln.ipAddrAdd(dummyVipInterface, externalIP, true)
-				if err != nil && err.Error() != IFACE_HAS_ADDR {
-					glog.Errorf("Failed to assign external ip %s to dummy interface %s due to %s", externalIP, KUBE_DUMMY_IF, err.Error())
-				}
-
-				// create IPVS service for the service to be exposed through the external ip
-				ipvsExternalIPSvc, err := nsc.ln.ipvsAddService(ipvsSvcs, net.ParseIP(externalIP), protocol, uint16(svc.port), svc.sessionAffinity, svc.scheduler, svc.flags)
-				if err != nil {
-					glog.Errorf("Failed to create ipvs service for external ip: %s due to %s", externalIP, err.Error())
-					continue
-				}
-				externalIpServices = append(externalIpServices, externalIPService{ipvsSvc: ipvsExternalIPSvc, externalIp: externalIP})
-				externalIpServiceId = generateIpPortId(externalIP, svc.protocol, strconv.Itoa(svc.port))
-
-				// ensure there is NO iptables mangle table rule to FWMARK the packet
-				fwMark := fmt.Sprint(generateFwmark(externalIP, svc.protocol, strconv.Itoa(svc.port)))
-				err = nsc.ln.cleanupMangleTableRule(externalIP, svc.protocol, strconv.Itoa(svc.port), fwMark)
-				if err != nil {
-					glog.Errorf("Failed to verify and cleanup any mangle table rule to FMWARD the traffic to external IP due to " + err.Error())
-					continue
-				}
-			}
-
-			activeServiceEndpointMap[externalIpServiceId] = make([]string, 0)
-			for _, endpoint := range endpoints {
-				if !svc.local || (svc.local && endpoint.isLocal) {
-					activeServiceEndpointMap[externalIpServiceId] = append(activeServiceEndpointMap[externalIpServiceId], endpoint.ip)
-				}
-			}
-		}
-
-		// add IPVS remote server to the IPVS service
-		for _, endpoint := range endpoints {
-			dst := ipvs.Destination{
-				Address:       net.ParseIP(endpoint.ip),
-				AddressFamily: syscall.AF_INET,
-				Port:          uint16(endpoint.port),
-				Weight:        1,
-			}
-
-			if !svc.local || (svc.local && endpoint.isLocal) {
-				err := nsc.ln.ipvsAddServer(ipvsClusterVipSvc, &dst)
-				if err != nil {
-					glog.Errorf(err.Error())
-				} else {
-					activeServiceEndpointMap[clusterServiceId] = append(activeServiceEndpointMap[clusterServiceId], endpoint.ip)
-				}
-			}
-
-			if svc.nodePort != 0 {
-				for i := 0; i < len(ipvsNodeportSvcs); i++ {
-					if !svc.local || (svc.local && endpoint.isLocal) {
-						err := nsc.ln.ipvsAddServer(ipvsNodeportSvcs[i], &dst)
-						if err != nil {
-							glog.Errorf(err.Error())
-						} else {
-							activeServiceEndpointMap[nodeServiceIds[i]] = append(activeServiceEndpointMap[nodeServiceIds[i]], endpoint.ip)
-						}
-					}
-				}
-			}
-
-			for _, externalIpService := range externalIpServices {
-				if svc.local && !endpoint.isLocal {
-					continue
-				}
-
-				if svc.directServerReturn && svc.directServerReturnMethod == "tunnel" {
-					dst.ConnectionFlags = ipvs.ConnectionFlagTunnel
-				}
-
-				// add server to IPVS service
-				err := nsc.ln.ipvsAddServer(externalIpService.ipvsSvc, &dst)
-				if err != nil {
-					glog.Errorf(err.Error())
-				}
-
-				// For now just support IPVS tunnel mode, we can add other ways of DSR in future
-				if svc.directServerReturn && svc.directServerReturnMethod == "tunnel" {
-
-					podObj, err := nsc.getPodObjectForEndpoint(endpoint.ip)
-					if err != nil {
-						glog.Errorf("Failed to find endpoint with ip: " + endpoint.ip + ". so skipping peparing endpoint for DSR")
-						continue
-					}
-
-					// we are only concerned with endpoint pod running on current node
-					if strings.Compare(podObj.Status.HostIP, nsc.nodeIP.String()) != 0 {
-						continue
-					}
-
-					containerID := strings.TrimPrefix(podObj.Status.ContainerStatuses[0].ContainerID, "docker://")
-					if containerID == "" {
-						glog.Errorf("Failed to find container id for the endpoint with ip: " + endpoint.ip + " so skipping peparing endpoint for DSR")
-						continue
-					}
-
-					err = nsc.ln.prepareEndpointForDsr(containerID, endpoint.ip, externalIpService.externalIp)
-					if err != nil {
-						glog.Errorf("Failed to prepare endpoint %s to do direct server return due to %s", endpoint.ip, err.Error())
-					}
-				}
-			}
-		}
-	}
-
-	// cleanup stale IPs on dummy interface
-	glog.V(1).Info("Cleaning up if any, old service IPs on dummy interface")
-	addrActive := make(map[string]bool)
-	for k := range activeServiceEndpointMap {
-		// verify active and its a generateIpPortId() type service
-		if strings.Contains(k, "-") {
-			parts := strings.SplitN(k, "-", 3)
-			addrActive[parts[0]] = true
-		}
-	}
-
-	var addrs []netlink.Addr
-	addrs, err = netlink.AddrList(dummyVipInterface, netlink.FAMILY_V4)
-	if err != nil {
-		return errors.New("Failed to list dummy interface IPs: " + err.Error())
-	}
-	for _, addr := range addrs {
-		isActive := addrActive[addr.IP.String()]
-		if !isActive {
-			glog.V(1).Infof("Found an IP %s which is no longer needed so cleaning up", addr.IP.String())
-			err := nsc.ln.ipAddrDel(dummyVipInterface, addr.IP.String())
-			if err != nil {
-				glog.Errorf("Failed to delete stale IP %s due to: %s",
-					addr.IP.String(), err.Error())
-				continue
-			}
-		}
-	}
-
-	// cleanup stale ipvs service and servers
-	glog.V(1).Info("Cleaning up if any, old ipvs service and servers which are no longer needed")
-	ipvsSvcs, err = nsc.ln.ipvsGetServices()
-
-	if err != nil {
-		return errors.New("Failed to list IPVS services: " + err.Error())
-	}
-	var protocol string
-	for _, ipvsSvc := range ipvsSvcs {
-		if ipvsSvc.Protocol == syscall.IPPROTO_TCP {
-			protocol = "tcp"
-		} else {
-			protocol = "udp"
-		}
-		var key string
-		if ipvsSvc.Address != nil {
-			key = generateIpPortId(ipvsSvc.Address.String(), protocol, strconv.Itoa(int(ipvsSvc.Port)))
-		} else if ipvsSvc.FWMark != 0 {
-			key = fmt.Sprint(ipvsSvc.FWMark)
-		} else {
-			continue
-		}
-
-		endpoints, ok := activeServiceEndpointMap[key]
-		// Only delete the service if it's not there anymore to prevent flapping
-		// old: if !ok || len(endpoints) == 0 {
-		if !ok {
-			glog.V(1).Infof("Found a IPVS service %s which is no longer needed so cleaning up",
-				ipvsServiceString(ipvsSvc))
-			err := nsc.ln.ipvsDelService(ipvsSvc)
-			if err != nil {
-				glog.Errorf("Failed to delete stale IPVS service %s due to: %s",
-					ipvsServiceString(ipvsSvc), err.Error())
-				continue
-			}
-		} else {
-			dsts, err := nsc.ln.ipvsGetDestinations(ipvsSvc)
-			if err != nil {
-				glog.Errorf("Failed to get list of servers from ipvs service")
-			}
-			for _, dst := range dsts {
-				validEp := false
-				for _, ep := range endpoints {
-					if ep == dst.Address.String() {
-						validEp = true
-						break
-					}
-				}
-				if !validEp {
-					glog.V(1).Infof("Found a destination %s in service %s which is no longer needed so cleaning up",
-						ipvsDestinationString(dst), ipvsServiceString(ipvsSvc))
-					err = nsc.ipvsDeleteDestination(ipvsSvc, dst)
-					if err != nil {
-						glog.Errorf("Failed to delete destination %s from ipvs service %s",
-							ipvsDestinationString(dst), ipvsServiceString(ipvsSvc))
-					}
-				}
-			}
-		}
-	}
-
-	err = nsc.syncIpvsFirewall()
-	if err != nil {
-		glog.Errorf("Error syncing ipvs svc iptables rules: %s", err.Error())
-	}
-
-	glog.V(1).Info("IPVS servers and services are synced to desired state")
-	return nil
-}
-
 func (nsc *NetworkServicesController) getPodObjectForEndpoint(endpointIP string) (*api.Pod, error) {
 	for _, obj := range nsc.podLister.List() {
 		pod := obj.(*api.Pod)
@@ -1402,6 +1041,7 @@ func (nsc *NetworkServicesController) buildServicesInfo() serviceInfoMap {
 			svcInfo := serviceInfo{
 				clusterIP:   net.ParseIP(svc.Spec.ClusterIP),
 				port:        int(port.Port),
+				targetPort:  port.TargetPort.String(),
 				protocol:    strings.ToLower(string(port.Protocol)),
 				nodePort:    int(port.NodePort),
 				name:        svc.ObjectMeta.Name,
@@ -2287,6 +1927,10 @@ func generateIpPortId(ip, protocol, port string) string {
 	return ip + "-" + protocol + "-" + port
 }
 
+func generateEndpointId(ip, port string) string {
+	return ip + ":" + port
+}
+
 // returns all IP addresses found on any network address in the system, excluding dummy and docker interfaces
 func getAllLocalIPs() ([]netlink.Addr, error) {
 	links, err := netlink.LinkList()
@@ -2468,6 +2112,15 @@ func NewNetworkServicesController(clientset kubernetes.Interface,
 		nsc.podCidr = cidr
 	}
 
+	nsc.excludedCidrs = make([]net.IPNet, len(config.ExcludedCidrs))
+	for i, excludedCidr := range config.ExcludedCidrs {
+		_, ipnet, err := net.ParseCIDR(excludedCidr)
+		if err != nil {
+			return nil, fmt.Errorf("Failed to get excluded CIDR details: %s", err.Error())
+		}
+		nsc.excludedCidrs[i] = *ipnet
+	}
+
 	node, err := utils.GetNodeObject(clientset, config.HostnameOverride)
 	if err != nil {
 		return nil, err
@@ -2484,6 +2137,8 @@ func NewNetworkServicesController(clientset kubernetes.Interface,
 
 	nsc.svcLister = svcInformer.GetIndexer()
 	nsc.ServiceEventHandler = nsc.newSvcEventHandler()
+
+	nsc.ipvsPermitAll = config.IpvsPermitAll
 
 	nsc.epLister = epInformer.GetIndexer()
 	nsc.EndpointsEventHandler = nsc.newEndpointsEventHandler()
